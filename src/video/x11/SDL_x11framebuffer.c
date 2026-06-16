@@ -22,8 +22,81 @@
 
 #ifdef SDL_VIDEO_DRIVER_X11
 
+#include "SDL_hints.h"
 #include "SDL_x11video.h"
 #include "SDL_x11framebuffer.h"
+
+/* --- Kindle e-ink (mxc_epdc) fast-refresh support ---------------------------
+ *
+ * The Kindle X server normally picks a slow, full GC16-style waveform. For
+ * animation we can instead drive the panel directly via the mxcfb framebuffer
+ * ioctls, selecting the A2 (or DU) 2-level waveform. A2 is 1-bit only, so the
+ * grayscale surface is ordered-dithered to pure black/white before presenting,
+ * and a periodic GC16 refresh clears accumulated ghosting.
+ *
+ * Enabled per-window via the SDL_X11_EINK_WAVEFORM hint ("a2" / "du" / "off").
+ *
+ * NOTE: the struct layout, ioctl numbers and waveform constants below are the
+ * common i.MX/Kindle values but ARE device/firmware specific. Verify them
+ * against the kernel mxcfb.h for the target firmware (and/or strace FBInk on
+ * device) before trusting the result. They are intentionally kept local so the
+ * build does not depend on Kindle kernel headers being present.
+ */
+#if defined(__linux__)
+#define SDL_X11_HAVE_EINK 1
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+#include <string.h>
+
+#ifndef WAVEFORM_MODE_DU
+#define WAVEFORM_MODE_DU   1
+#endif
+#ifndef WAVEFORM_MODE_GC16
+#define WAVEFORM_MODE_GC16 2
+#endif
+#ifndef WAVEFORM_MODE_A2
+#define WAVEFORM_MODE_A2   4   /* TODO: confirm per device (often 4 or 6) */
+#endif
+
+#define EINK_UPDATE_MODE_PARTIAL 0x0
+#define EINK_UPDATE_MODE_FULL    0x1
+#define EINK_TEMP_USE_AMBIENT    0x1000
+
+/* Issue a GC16 full refresh every N frames to clear A2 ghosting. Tunable. */
+#define EINK_DEGHOST_EVERY 32
+
+struct sdl_mxcfb_rect
+{
+    Uint32 top;
+    Uint32 left;
+    Uint32 width;
+    Uint32 height;
+};
+
+struct sdl_mxcfb_alt_buffer_data
+{
+    Uint32 phys_addr;
+    Uint32 width;
+    Uint32 height;
+    struct sdl_mxcfb_rect alt_update_region;
+};
+
+struct sdl_mxcfb_update_data
+{
+    struct sdl_mxcfb_rect update_region;
+    Uint32 waveform_mode;
+    Uint32 update_mode;
+    Uint32 update_marker;
+    int temp;
+    unsigned int flags;
+    struct sdl_mxcfb_alt_buffer_data alt_buffer_data;
+};
+
+/* TODO: confirm the ioctl number for the target firmware. */
+#define SDL_MXCFB_SEND_UPDATE _IOW('F', 0x2E, struct sdl_mxcfb_update_data)
+#endif /* __linux__ */
 
 #ifndef NO_SHARED_MEMORY
 
@@ -47,6 +120,102 @@ static SDL_bool have_mitshm(Display *dpy)
 
 #endif /* !NO_SHARED_MEMORY */
 
+/* Textbook 4x4 Bayer ordered-dither threshold matrix (values 0..15). Ordered
+   dithering is deterministic per (x,y), so unchanged regions stay byte-identical
+   between frames -- exactly what A2 partial updates want. */
+static const Uint8 eink_bayer4[4][4] = {
+    {  0,  8,  2, 10 },
+    { 12,  4, 14,  6 },
+    {  3, 11,  1,  9 },
+    { 15,  7, 13,  5 }
+};
+
+/* Convert one clipped rect of the ARGB8888 app surface to the Y8 grayscale
+   XImage buffer. When dither is true, ordered-dither down to 1-bit (0x00/0xFF)
+   for 2-level e-ink waveforms (A2/DU); otherwise keep the full 8bpp luma. */
+static void X11_grayscale_convert_rect(SDL_WindowData *data, int window_w,
+                                       int x, int y, int w, int h, SDL_bool dither)
+{
+    const Uint32 *src = (const Uint32 *)data->argb_buf;
+    unsigned char *dst = data->grayscale_buf;
+    int r, c;
+
+    for (r = y; r < y + h; ++r) {
+        const Uint32 *row = src + (size_t)r * window_w;
+        unsigned char *grow = dst + (size_t)r * window_w;
+        for (c = x; c < x + w; ++c) {
+            Uint32 p = row[c];
+            unsigned int R = (p >> 16) & 0xFF;
+            unsigned int G = (p >>  8) & 0xFF;
+            unsigned int B = (p      ) & 0xFF;
+            /* BT.601 luma: Y = 0.299R + 0.587G + 0.114B (integer approx) */
+            unsigned int gray = (77 * R + 150 * G + 29 * B) >> 8;
+            if (dither) {
+                unsigned int t = (unsigned int)eink_bayer4[r & 3][c & 3] * 16; /* 0..240 */
+                grow[c] = (gray > t) ? 0xFF : 0x00;
+            } else {
+                grow[c] = (unsigned char)gray;
+            }
+        }
+    }
+}
+
+#ifdef SDL_X11_HAVE_EINK
+/* Map the SDL_X11_EINK_WAVEFORM hint to a 2-level waveform id, or 0 if disabled. */
+static int X11_eink_parse_hint(void)
+{
+    const char *hint = SDL_GetHint("SDL_X11_EINK_WAVEFORM");
+    if (!hint || !*hint || SDL_strcasecmp(hint, "off") == 0) {
+        return 0;
+    }
+    if (SDL_strcasecmp(hint, "a2") == 0) {
+        return WAVEFORM_MODE_A2;
+    }
+    if (SDL_strcasecmp(hint, "du") == 0) {
+        return WAVEFORM_MODE_DU;
+    }
+    SDL_Log("SDL_X11_EINK_WAVEFORM: unknown value '%s' (expected a2/du/off)", hint);
+    return 0;
+}
+
+/* Drive the e-ink panel for one presented rect: the configured 2-level waveform
+   most of the time, with a periodic GC16 full refresh to clear ghosting. */
+static void X11_eink_update(SDL_WindowData *data, int x, int y, int w, int h)
+{
+    struct sdl_mxcfb_update_data upd;
+    SDL_bool full_refresh;
+
+    if (data->eink_fd < 0 || data->eink_waveform == 0) {
+        return;
+    }
+
+    data->eink_frame_count++;
+    full_refresh = (data->eink_frame_count >= EINK_DEGHOST_EVERY) ? SDL_TRUE : SDL_FALSE;
+
+    SDL_zero(upd);
+    upd.update_region.left   = (Uint32)x;
+    upd.update_region.top    = (Uint32)y;
+    upd.update_region.width  = (Uint32)w;
+    upd.update_region.height = (Uint32)h;
+    upd.update_marker = ++data->eink_marker;
+    upd.temp = EINK_TEMP_USE_AMBIENT;
+
+    if (full_refresh) {
+        upd.waveform_mode = WAVEFORM_MODE_GC16;
+        upd.update_mode   = EINK_UPDATE_MODE_FULL;
+        data->eink_frame_count = 0;
+    } else {
+        upd.waveform_mode = (Uint32)data->eink_waveform;
+        upd.update_mode   = EINK_UPDATE_MODE_PARTIAL;
+    }
+
+    if (ioctl(data->eink_fd, SDL_MXCFB_SEND_UPDATE, &upd) == -1) {
+        SDL_LogDebug(SDL_LOG_CATEGORY_VIDEO,
+                     "mxcfb update ioctl failed: %s", strerror(errno));
+    }
+}
+#endif /* SDL_X11_HAVE_EINK */
+
 int X11_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
                                 void **pixels, int *pitch)
 {
@@ -55,6 +224,7 @@ int X11_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
     XGCValues gcv;
     XVisualInfo vinfo;
     int w, h;
+    int eink_wave = 0;
 
     SDL_GetWindowSizeInPixels(window, &w, &h);
 
@@ -74,6 +244,7 @@ int X11_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
     }
 
     *format = X11_GetPixelFormatFromVisualInfo(display, &vinfo);
+
     if (*format == SDL_PIXELFORMAT_UNKNOWN) {
         SDL_Log("X11 framebuffer: visual class=%d depth=%d red=0x%lx green=0x%lx blue=0x%lx",
             vinfo.class, vinfo.depth,
@@ -81,10 +252,19 @@ int X11_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
         return SDL_SetError("Unknown window pixel format");
     }
 
-    /* StaticGray/GrayScale 8bpp (Kindle e-ink): the app renders in ARGB8888;
-       we keep a private 8bpp Y8 buffer for the XImage and convert on every present. */
-    if (*format == SDL_PIXELFORMAT_INDEX8 &&
-        (vinfo.class == StaticGray || vinfo.class == GrayScale)) {
+#ifdef SDL_X11_HAVE_EINK
+    eink_wave = X11_eink_parse_hint();
+#endif
+
+    /* Private 8bpp XImage buffer + ARGB8888 app surface. Engaged when either:
+         - the visual is a Kindle StaticGray/GrayScale INDEX8 ramp (ARGB -> Y8), or
+         - any 8bpp visual with an A2/DU e-ink waveform requested. In that case the
+           per-rect conversion ordered-dithers to pure 0x00/0xFF, which is a valid
+           black/white pixel in any 8bpp visual (incl. the Kindle's DirectColor
+           RGB332), so it works without caring about the channel layout. */
+    if ((*format == SDL_PIXELFORMAT_INDEX8 &&
+         (vinfo.class == StaticGray || vinfo.class == GrayScale)) ||
+        (vinfo.depth == 8 && eink_wave != 0)) {
         data->grayscale_buf = (unsigned char *)SDL_malloc((size_t)w * h);
         if (!data->grayscale_buf) {
             return SDL_OutOfMemory();
@@ -111,6 +291,23 @@ int X11_CreateWindowFramebuffer(_THIS, SDL_Window *window, Uint32 *format,
         }
         SDL_memset(*pixels, 0, (size_t)h * (*pitch));
         data->argb_buf = *pixels;
+
+        /* Optional A2/DU fast-refresh: open the e-ink fb and pick the waveform. */
+        data->eink_fd = -1;
+        data->eink_waveform = 0;
+        data->eink_frame_count = 0;
+        data->eink_marker = 0;
+#ifdef SDL_X11_HAVE_EINK
+        data->eink_waveform = eink_wave;
+        if (data->eink_waveform != 0) {
+            data->eink_fd = open("/dev/fb0", O_RDWR);
+            if (data->eink_fd < 0) {
+                SDL_Log("SDL_X11_EINK_WAVEFORM set but couldn't open /dev/fb0 (%s); "
+                        "falling back to 8bpp grayscale", strerror(errno));
+                data->eink_waveform = 0;
+            }
+        }
+#endif
         return 0;
     }
 
@@ -189,86 +386,54 @@ int X11_UpdateWindowFramebuffer(_THIS, SDL_Window *window, const SDL_Rect *rects
 
     SDL_GetWindowSizeInPixels(window, &window_w, &window_h);
 
-    /* StaticGray path: convert dirty rects from ARGB8888 app surface to Y8 grayscale */
-    if (data->grayscale_buf) {
-        const Uint32 *src = (const Uint32 *)data->argb_buf;
-        unsigned char *dst = data->grayscale_buf;
-        int r, c;
-        for (r = 0; r < window_h; ++r) {
-            const Uint32 *row = src + r * window_w;
-            unsigned char *grow = dst + r * window_w;
-            for (c = 0; c < window_w; ++c) {
-                Uint32 p = row[c];
-                unsigned int R = (p >> 16) & 0xFF;
-                unsigned int G = (p >>  8) & 0xFF;
-                unsigned int B = (p      ) & 0xFF;
-                /* BT.601 luma: Y = 0.299R + 0.587G + 0.114B (integer approx) */
-                grow[c] = (unsigned char)((77 * R + 150 * G + 29 * B) >> 8);
-            }
+    for (i = 0; i < numrects; ++i) {
+        x = rects[i].x;
+        y = rects[i].y;
+        w = rects[i].w;
+        h = rects[i].h;
+
+        if (w <= 0 || h <= 0 || (x + w) <= 0 || (y + h) <= 0) {
+            /* Clipped? */
+            continue;
         }
-    }
+        if (x < 0) {
+            x += w;
+            w += rects[i].x;
+        }
+        if (y < 0) {
+            y += h;
+            h += rects[i].y;
+        }
+        if (x + w > window_w) {
+            w = window_w - x;
+        }
+        if (y + h > window_h) {
+            h = window_h - y;
+        }
+
+        /* StaticGray path: convert just this dirty rect from ARGB8888 to Y8
+           grayscale (ordered-dithered to 1-bit when a 2-level e-ink waveform
+           is active). */
+        if (data->grayscale_buf) {
+            X11_grayscale_convert_rect(data, window_w, x, y, w, h,
+                                       (data->eink_waveform != 0) ? SDL_TRUE : SDL_FALSE);
+        }
 
 #ifndef NO_SHARED_MEMORY
-    if (data->use_mitshm) {
-        for (i = 0; i < numrects; ++i) {
-            x = rects[i].x;
-            y = rects[i].y;
-            w = rects[i].w;
-            h = rects[i].h;
-
-            if (w <= 0 || h <= 0 || (x + w) <= 0 || (y + h) <= 0) {
-                /* Clipped? */
-                continue;
-            }
-            if (x < 0) {
-                x += w;
-                w += rects[i].x;
-            }
-            if (y < 0) {
-                y += h;
-                h += rects[i].y;
-            }
-            if (x + w > window_w) {
-                w = window_w - x;
-            }
-            if (y + h > window_h) {
-                h = window_h - y;
-            }
-
+        if (data->use_mitshm) {
             X11_XShmPutImage(display, data->xwindow, data->gc, data->ximage,
                              x, y, x, y, w, h, False);
-        }
-    } else
+        } else
 #endif /* !NO_SHARED_MEMORY */
-    {
-        for (i = 0; i < numrects; ++i) {
-            x = rects[i].x;
-            y = rects[i].y;
-            w = rects[i].w;
-            h = rects[i].h;
-
-            if (w <= 0 || h <= 0 || (x + w) <= 0 || (y + h) <= 0) {
-                /* Clipped? */
-                continue;
-            }
-            if (x < 0) {
-                x += w;
-                w += rects[i].x;
-            }
-            if (y < 0) {
-                y += h;
-                h += rects[i].y;
-            }
-            if (x + w > window_w) {
-                w = window_w - x;
-            }
-            if (y + h > window_h) {
-                h = window_h - y;
-            }
-
+        {
             X11_XPutImage(display, data->xwindow, data->gc, data->ximage,
                           x, y, x, y, w, h);
         }
+
+#ifdef SDL_X11_HAVE_EINK
+        /* Drive the panel refresh for this rect using the chosen waveform. */
+        X11_eink_update(data, x, y, w, h);
+#endif
     }
 
     X11_XSync(display, False);
@@ -307,6 +472,13 @@ void X11_DestroyWindowFramebuffer(_THIS, SDL_Window *window)
         SDL_free(data->argb_buf);
         data->argb_buf = NULL;
     }
+#ifdef SDL_X11_HAVE_EINK
+    if (data->eink_fd >= 0) {
+        close(data->eink_fd);
+        data->eink_fd = -1;
+        data->eink_waveform = 0;
+    }
+#endif
     if (data->gc) {
         X11_XFreeGC(display, data->gc);
         data->gc = NULL;
