@@ -54,6 +54,10 @@ typedef struct
     XImage *ximage;
     unsigned char *grayscale_buf; /* 8bpp Y8 XImage data for StaticGray displays (freed by XDestroyImage) */
     void *argb_buf;               /* ARGB8888 app surface pixels for StaticGray displays */
+    int eink_fd;                  /* /dev/fb0 fd for direct e-ink waveform control, or -1 when disabled */
+    int eink_waveform;            /* chosen 2-level waveform id (A2/DU) for fast refresh, or 0 = disabled */
+    Uint32 eink_frame_count;      /* frames since the last GC16 de-ghost refresh */
+    Uint32 eink_marker;           /* incrementing mxcfb update_marker */
     GC gc;
     XIC ic;
     SDL_bool created;
