@@ -37,6 +37,11 @@ set(ENV{PKG_CONFIG_SYSROOT_DIR} "${SYSROOT}")
 set(ENV{PKG_CONFIG_LIBDIR}      "${SYSROOT}/usr/lib/pkgconfig:${SYSROOT}/usr/share/pkgconfig")
 
 # SDL Specific
+
+## Subsystems ##
+set(SDL_CAMERA OFF)
+
+## System Specific ##
 set(SDL_X11 ON CACHE BOOL "" FORCE)
 set(SDL_X11_XINPUT ON CACHE BOOL "" FORCE)
 set(SDL_KINDLE_EINK ON CACHE BOOL "" FORCE)
