@@ -52,6 +52,7 @@ class SdlPlatform(Enum):
     NetBSD = "netbsd"
     OpenBSD = "openbsd"
     Watcom = "watcom"
+    OS2EMX = "os2emx"
 
 
 class Msys2Platform(Enum):
@@ -134,7 +135,8 @@ JOB_SPECS = {
     "openbsd": JobSpec(name="OpenBSD",                                      os=JobOs.UbuntuLatest,  platform=SdlPlatform.OpenBSD,     artifact="SDL-openbsd-x64",  autotools=True, ),
     "freebsd": JobSpec(name="FreeBSD",                                      os=JobOs.UbuntuLatest,  platform=SdlPlatform.FreeBSD,     artifact="SDL-freebsd-x64", autotools=True, ),
     "watcom-win32": JobSpec(name="Watcom (Windows)",                        os=JobOs.WindowsLatest, platform=SdlPlatform.Watcom,      artifact="SDL-watcom-win32",  no_cmake=True, watcom_platform=WatcomPlatform.Windows ),
-    "watcom-os2": JobSpec(name="Watcom (OS/2)",                             os=JobOs.WindowsLatest, platform=SdlPlatform.Watcom,      artifact="SDL-watcom-win32",  no_cmake=True, watcom_platform=WatcomPlatform.OS2 ),
+    "watcom-os2": JobSpec(name="Watcom (OS/2)",                             os=JobOs.WindowsLatest, platform=SdlPlatform.Watcom,      artifact="SDL-watcom-os2",  no_cmake=True, watcom_platform=WatcomPlatform.OS2 ),
+    "os2-emx": JobSpec(name="OS/2 EMX (KLIBC)",                             os=JobOs.UbuntuLatest,  platform=SdlPlatform.OS2EMX,      artifact="SDL-os2-emx", ),
     # "watcom-win32"
     # "watcom-os2"
 }
@@ -143,6 +145,7 @@ JOB_SPECS = {
 class StaticLibType(Enum):
     MSVC = "SDL2-static.lib"
     A = "libSDL2.a"
+    A_NOLIB = "SDL2.a"
 
 
 class SharedLibType(Enum):
@@ -193,7 +196,6 @@ class JobDetails:
     cc_from_cmake: bool = False
     source_cmd: str = ""
     pretest_cmd: str = ""
-    android_apks: list[str] = dataclasses.field(default_factory=list)
     android_ndk: bool = False
     android_mk: bool = False
     minidump: bool = False
@@ -264,7 +266,6 @@ class JobDetails:
             "static-lib": self.static_lib.value if self.static_lib else None,
             "cmake-build-type": self.cmake_build_type,
             "run-tests": self.run_tests,
-            "android-apks": my_shlex_join(self.android_apks),
             "android-mk": self.android_mk,
             "werror": self.werror,
             "sudo": self.sudo,
@@ -508,14 +509,6 @@ def spec_to_job(spec: JobSpec, key: str, trackmem_symbol_names: bool) -> JobDeta
                 ))
                 job.cmake_toolchain_file = "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"
                 job.cc = f"${{ANDROID_NDK_HOME}}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target={spec.android_arch}-none-linux-androideabi{spec.android_platform}"
-
-                job.android_apks = [
-                    "testaudiorecording-apk",
-                    "testautomation-apk",
-                    "testcontroller-apk",
-                    "testmultiaudio-apk",
-                    "testsprite-apk",
-                ]
         case SdlPlatform.Emscripten:
             job.run_tests = False
             job.shared = False
@@ -668,6 +661,18 @@ def spec_to_job(spec: JobSpec, key: str, trackmem_symbol_names: bool) -> JobDeta
                     job.run_tests = True
                 case _:
                     raise ValueError(f"Unsupported watcom_platform=${spec.watcom_platform}")
+        case SdlPlatform.OS2EMX:
+            fpic = False
+            job.apt_packages = []
+            job.build_autotools_tests = False
+            job.run_tests = False
+            job.cmake_generator = "Unix Makefiles"
+            job.cmake_build_arguments.append("-j$(nproc)")
+            job.cc_from_cmake = True
+            job.cmake_toolchain_file = "$OS2EMX_CMAKE_TOOLCHAIN_FILE"
+            job.sudo = ""
+            job.shared_lib = SharedLibType.WIN32
+            job.static_lib = StaticLibType.A_NOLIB
         case _:
             raise ValueError(f"Unsupported platform={spec.platform}")
 

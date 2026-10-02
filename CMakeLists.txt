@@ -305,7 +305,7 @@ set(SDL_CFLAGS )
 
 # When building shared lib for Windows with MinGW,
 # avoid the DLL having a "lib" prefix
-if(WINDOWS)
+if(WINDOWS OR OS2)
   set(CMAKE_SHARED_LIBRARY_PREFIX "")
 endif()
 
@@ -1109,6 +1109,7 @@ if(SDL_LIBC)
       check_symbol_exists("${_FN}" "${STDC_HEADER_NAMES}" ${_HAVEVAR})
     endforeach()
 
+    check_symbol_exists(getexecpath "unistd.h" HAVE_GETEXECPATH)
     check_symbol_exists(sigaction "signal.h" HAVE_SIGACTION)
     check_symbol_exists(sigtimedwait "signal.h" HAVE_SIGTIMEDWAIT)
     check_symbol_exists(setjmp "setjmp.h" HAVE_SETJMP)
@@ -2316,7 +2317,7 @@ elseif(APPLE)
   endif()
 
   # Minimum version for $<LINK_LIBRARY:feature,library-list>
-  cmake_minimum_required(VERSION 3.24)
+  cmake_minimum_required(VERSION 3.24...4.3)
 
   # Actually load the frameworks at the end so we don't duplicate include.
   if(SDL_FRAMEWORK_COREVIDEO)
@@ -2817,6 +2818,7 @@ elseif(PS2)
 
 elseif(OS2)
   list(APPEND EXTRA_CFLAGS "-DOS2EMX_PLAIN_CHAR")
+  #list(APPEND EXTRA_CFLAGS "-DOS2DEBUG=2")
 
   file(GLOB CORE_SOURCES ${SDL2_SOURCE_DIR}/src/core/os2/*.c)
   list(APPEND SOURCE_FILES ${CORE_SOURCES})
@@ -2828,12 +2830,13 @@ elseif(OS2)
   if(SDL_THREADS)
     set(SDL_THREAD_OS2 1)
     file(GLOB OS2_THREAD_SOURCES ${SDL2_SOURCE_DIR}/src/thread/os2/*.c)
-    list(APPEND SOURCE_FILES ${OS2_THREAD_SOURCES})
+    list(APPEND SOURCE_FILES ${OS2_THREAD_SOURCES}
+      ${SDL2_SOURCE_DIR}/src/thread/generic/SDL_syscond.c)
     set(HAVE_SDL_THREADS TRUE)
   endif()
 
   if(SDL_TIMERS)
-    set(SDL_TIMER_UNIX 1)
+    set(SDL_TIMER_OS2 1)
     file(GLOB OS2_TIMER_SOURCES ${SDL2_SOURCE_DIR}/src/timer/os2/*.c)
     list(APPEND SOURCE_FILES ${OS2_TIMER_SOURCES})
     set(HAVE_SDL_TIMERS TRUE)
@@ -3309,7 +3312,7 @@ if (SDL_ASAN)
 endif()
 
 if(SDL_CCACHE AND NOT CMAKE_VERSION VERSION_LESS 3.4)
-  cmake_minimum_required(VERSION 3.4...3.5)
+  cmake_minimum_required(VERSION 3.4...4.3)
   find_program(CCACHE_BINARY ccache)
   if(CCACHE_BINARY)
     set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_BINARY})
@@ -3492,10 +3495,15 @@ if(SDL_SHARED)
       set_target_properties(SDL2 PROPERTIES
         DEFINE_SYMBOL BUILD_SDL)
     endif()
-    set_target_properties(SDL2 PROPERTIES
-      VERSION ${SDL_VERSION}
-      SOVERSION ${LT_REVISION}
-      OUTPUT_NAME "SDL2")
+    if(OS2)
+      set_target_properties(SDL2 PROPERTIES
+        OUTPUT_NAME "SDL2")
+    else()
+      set_target_properties(SDL2 PROPERTIES
+        VERSION ${SDL_VERSION}
+        SOVERSION ${LT_REVISION}
+        OUTPUT_NAME "SDL2")
+    endif()
   endif()
   # Note: The clang toolset for Visual Studio does not support /NODEFAULTLIB.
   if(MSVC AND NOT SDL_LIBC AND NOT MSVC_CLANG AND NOT SDL_CPU_ARM32)
